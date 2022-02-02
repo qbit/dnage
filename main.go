@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"strings"
-	"time"
 
 	"filippo.io/age"
 	"filippo.io/age/agessh"
@@ -18,15 +19,25 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+var (
+	port       string
+	nameServer string
+	nsProto    string
+	message    string
+)
+
 type dnsSecHostKey struct {
-	key     ssh.PublicKey
-	message []string
+	message string
+}
+
+func dnsSecErr(err error) {
+	log.Fatalf("DNSSEC: %v\n", err)
 }
 
 func (d *dnsSecHostKey) check(hostAndPort string, remote net.Addr, key ssh.PublicKey) error {
 	config := dns.ClientConfig{
 		Servers: []string{
-			"9.9.9.9",
+			nameServer,
 		},
 		Port: "53",
 	}
@@ -42,10 +53,10 @@ func (d *dnsSecHostKey) check(hostAndPort string, remote net.Addr, key ssh.Publi
 
 	r, _, err := c.Exchange(m, config.Servers[0]+":"+config.Port)
 	if err != nil {
-		return err
+		dnsSecErr(err)
 	}
 	if r.Rcode != dns.RcodeSuccess {
-		return fmt.Errorf("non-success response code: %d", r.Rcode)
+		dnsSecErr(fmt.Errorf("non-success response code: %d", r.Rcode))
 	}
 
 	keyBytes := key.Marshal()
@@ -54,41 +65,33 @@ func (d *dnsSecHostKey) check(hostAndPort string, remote net.Addr, key ssh.Publi
 		if fp, ok := a.(*dns.SSHFP); ok {
 			fingerprint, err := hex.DecodeString(fp.FingerPrint)
 			if err != nil {
-				return err
+				dnsSecErr(err)
 			}
 
-			if fp.Algorithm > 3 && fp.Type > 1 {
+			// We only work with ed25519 keys.
+			if fp.Algorithm == 4 && fp.Type == 2 {
 				hasSSHFP = true
-				fmt.Println(fp.Algorithm)
-				switch fp.Type {
-				case 2:
-					hash := sha256.Sum256(keyBytes)
-					if !bytes.Equal(fingerprint, hash[:]) {
-						return fmt.Errorf("key mismatch for sha256")
-					}
-					return encryptData(key, strings.Join(d.message, " "))
-					/*case 1:
-					hash := sha1.Sum(keyBytes)
-					if !bytes.Equal(fingerprint, hash[:]) {
-						return fmt.Errorf("key mismatch for sha1")
-					}
-					*/
+				hash := sha256.Sum256(keyBytes)
+				if !bytes.Equal(fingerprint, hash[:]) {
+					dnsSecErr(fmt.Errorf("key mismatch for %q", hostAndPort))
 				}
-			} else {
-				continue
+				err := encryptData(key, d.message)
+				if err != nil {
+					log.Fatalln(fmt.Errorf("age: %w", err))
+				}
 			}
 		}
 	}
 
-	if hasSSHFP == false {
-		return fmt.Errorf("no SSHFP record found for %q", hostname)
+	if !hasSSHFP {
+		dnsSecErr(fmt.Errorf("no SSHFP record found for %q", hostname))
 	}
 
 	return nil
 }
 
 //DNSSECHostKey checks a hostkey against a DNSSEC SSHFP record
-func DNSSECHostKey(message []string) ssh.HostKeyCallback {
+func DNSSECHostKey(message string) ssh.HostKeyCallback {
 	hk := &dnsSecHostKey{
 		message: message,
 	}
@@ -98,7 +101,7 @@ func DNSSECHostKey(message []string) ssh.HostKeyCallback {
 func encryptData(pk ssh.PublicKey, data string) error {
 	recipient, err := agessh.NewEd25519Recipient(pk)
 	if err != nil {
-		return fmt.Errorf("failed to parse public key %q: %v", pk, err)
+		return err
 	}
 
 	buf := &bytes.Buffer{}
@@ -123,23 +126,23 @@ func encryptData(pk ssh.PublicKey, data string) error {
 	return nil
 }
 
-func usage() {
-	fmt.Println("dnage hostname 'message'")
-}
-
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(1)
+	flag.StringVar(&port, "p", "22", "SSH port to connect to")
+	flag.StringVar(&nameServer, "n", "9.9.9.9", "Name server to use, must support DNSSEC.")
+	flag.StringVar(&nsProto, "np", "udp", "Protocol to query Name server with. Possibilities: tcp, tcp-tls, udp")
+	flag.StringVar(&message, "m", "", "Message to encrypt")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags] example.com\n\n", os.Args[0])
+		flag.PrintDefaults()
+		os.Exit(2)
 	}
+	flag.Parse()
 
 	config := &ssh.ClientConfig{
-		HostKeyCallback: DNSSECHostKey(os.Args[2:]),
-		Timeout:         30 * time.Second,
+		HostKeyAlgorithms: []string{"ssh-ed25519"},
+		HostKeyCallback:   DNSSECHostKey(message),
 	}
 
-	_, err := ssh.Dial("tcp", os.Args[1], config)
-	if err != nil {
-		fmt.Println(err)
-	}
+	// This will fail as we have no auth mechanisms
+	_, _ = ssh.Dial("tcp", os.Args[len(os.Args)-1]+":"+port, config)
 }
