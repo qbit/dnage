@@ -65,9 +65,10 @@ func main() {
 	config := &ssh.ClientConfig{
 		HostKeyAlgorithms: []string{"ssh-ed25519"},
 		HostKeyCallback: hostkeydns.CheckDNSSecHostKey(hostkeydns.DNSSecResolvers{
-			Servers: []string{nameServer},
-			Port:    "53",
-			Net:     nsProto,
+			Servers:           []string{nameServer},
+			Port:              "53",
+			Net:               nsProto,
+			HostKeyAlgorithms: []string{"ssh-ed25519"},
 			Success: func(key ssh.PublicKey) {
 				err := encryptData(key, message)
 				if err != nil {
