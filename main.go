@@ -2,21 +2,17 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
-	"strings"
 
 	"filippo.io/age"
 	"filippo.io/age/agessh"
 	"filippo.io/age/armor"
-	"github.com/miekg/dns"
 	"golang.org/x/crypto/ssh"
+	"suah.dev/hostkeydns"
 )
 
 var (
@@ -25,78 +21,6 @@ var (
 	nsProto    string
 	message    string
 )
-
-type dnsSecHostKey struct {
-	message string
-}
-
-func dnsSecErr(err error) {
-	log.Fatalf("DNSSEC: %v\n", err)
-}
-
-func (d *dnsSecHostKey) check(hostAndPort string, remote net.Addr, key ssh.PublicKey) error {
-	config := dns.ClientConfig{
-		Servers: []string{
-			nameServer,
-		},
-		Port: "53",
-	}
-	hostname := strings.Split(hostAndPort, ":")[0]
-	c := dns.Client{
-		Net: "tcp",
-	}
-	m := &dns.Msg{}
-	m.SetEdns0(4096, true)
-
-	m.SetQuestion(hostname+".", dns.TypeSSHFP)
-	m.RecursionDesired = true
-
-	r, _, err := c.Exchange(m, config.Servers[0]+":"+config.Port)
-	if err != nil {
-		dnsSecErr(err)
-	}
-	if r.Rcode != dns.RcodeSuccess {
-		dnsSecErr(fmt.Errorf("non-success response code: %d", r.Rcode))
-	}
-
-	keyBytes := key.Marshal()
-	hasSSHFP := false
-	for _, a := range r.Answer {
-		if fp, ok := a.(*dns.SSHFP); ok {
-			fingerprint, err := hex.DecodeString(fp.FingerPrint)
-			if err != nil {
-				dnsSecErr(err)
-			}
-
-			// We only work with ed25519 keys.
-			if fp.Algorithm == 4 && fp.Type == 2 {
-				hasSSHFP = true
-				hash := sha256.Sum256(keyBytes)
-				if !bytes.Equal(fingerprint, hash[:]) {
-					dnsSecErr(fmt.Errorf("key mismatch for %q", hostAndPort))
-				}
-				err := encryptData(key, d.message)
-				if err != nil {
-					log.Fatalln(fmt.Errorf("age: %w", err))
-				}
-			}
-		}
-	}
-
-	if !hasSSHFP {
-		dnsSecErr(fmt.Errorf("no SSHFP record found for %q", hostname))
-	}
-
-	return nil
-}
-
-//DNSSECHostKey checks a hostkey against a DNSSEC SSHFP record
-func DNSSECHostKey(message string) ssh.HostKeyCallback {
-	hk := &dnsSecHostKey{
-		message: message,
-	}
-	return hk.check
-}
 
 func encryptData(pk ssh.PublicKey, data string) error {
 	recipient, err := agessh.NewEd25519Recipient(pk)
@@ -140,7 +64,17 @@ func main() {
 
 	config := &ssh.ClientConfig{
 		HostKeyAlgorithms: []string{"ssh-ed25519"},
-		HostKeyCallback:   DNSSECHostKey(message),
+		HostKeyCallback: hostkeydns.CheckDNSSecHostKey(hostkeydns.DNSSecResolvers{
+			Servers: []string{nameServer},
+			Port:    "53",
+			Net:     nsProto,
+			Success: func(key ssh.PublicKey) {
+				err := encryptData(key, message)
+				if err != nil {
+					log.Fatal(err)
+				}
+			},
+		}),
 	}
 
 	// This will fail as we have no auth mechanisms
